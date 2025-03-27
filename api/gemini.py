@@ -52,14 +52,13 @@ def get_vision_response(prompt: str, image_data: Union[str, bytes]) -> str:
         str: The model's response text
     """
     try:
-        # Convert image data to PIL Image
-        if isinstance(image_data, str):
-            if image_data.startswith('data:image'):
-                image_data = image_data.split(',')[1]
-            image_data = base64.b64decode(image_data)
-        
-        # Convert bytes to PIL Image
-        image = Image.open(io.BytesIO(image_data))
+        # Convert bytes to PIL Image if needed
+        if isinstance(image_data, bytes):
+            image = Image.open(io.BytesIO(image_data))
+        else:
+            # Assume it's base64 encoded
+            image_bytes = base64.b64decode(image_data)
+            image = Image.open(io.BytesIO(image_bytes))
         
         response = vision_model.generate_content([prompt, image])
         return response.text
@@ -76,17 +75,12 @@ def analyze_conversation_type(messages: List[dict]) -> str:
     Returns:
         str: The determined request type
     """
-    # Get last 3 messages for context
-    recent_messages = messages[-3:] if len(messages) > 3 else messages
-    context = "\n".join([f"{msg['role']}: {msg['content']}" for msg in recent_messages])
-    
-    prompt = f"""Determine the type of request from this conversation:
-{context}
-
-Respond with ONLY ONE of these categories:
-- defineObjective (if user wants to set a health goal)
-- defineHealthProfile (if determining metrics to track)
-- collectMetrics (if user is providing health data)
-- scanFood (if user is asking about food)"""
-    
-    return get_text_response(prompt).strip().lower()
+    try:
+        # Join all messages into a single prompt
+        conversation = "\n".join([f"{msg['role']}: {msg['content']}" for msg in messages])
+        prompt = f"Analyze this conversation and determine the type of request:\n{conversation}\n\nReturn ONLY one of these exact values: defineObjective, defineHealthProfile, collectHealthMetrics, scanFood"
+        
+        response = get_text_response(prompt)
+        return response.strip()
+    except Exception as e:
+        raise Exception(f"Error analyzing conversation type: {str(e)}")
