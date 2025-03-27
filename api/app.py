@@ -9,7 +9,7 @@ import logging
 import time
 from datetime import datetime
 from dotenv import load_dotenv
-from gemini import get_text_response, get_vision_response
+from .gemini import get_text_response, get_vision_response
 from functools import wraps
 # Import AI21 client library
 from ai21 import AI21Client
