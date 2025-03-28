@@ -290,39 +290,32 @@ def analyze_ingredients():
             return jsonify({'error': 'AI21 client initialization failed'}), 500
 
         # Split ingredients into smaller chunks if too many
-        chunk_size = 10
+        chunk_size = 20
         ingredient_chunks = [ingredients[i:i + chunk_size] for i in range(0, len(ingredients), chunk_size)]
         
         all_analyzed_ingredients = []
         
         for chunk in ingredient_chunks:
             # Create a detailed prompt for ingredient analysis
-            system_prompt = """You are a health and nutrition expert. Analyze each ingredient's impact on the provided health metrics.
+            system_prompt = """You are a health and nutrition expert. Analyze each ingredient's impact on health metrics.
 For each ingredient, determine:
-1. Specific impacts on each relevant health metric
-2. Overall classification (very good, good, bad, or very bad) based on the health context
-3. Any specific warnings or recommendations
+1. Overall classification (good/bad)
+2. Key impacts on health
+3. Any warnings
 
-Provide your analysis in this exact JSON format:
+Provide analysis in this JSON format:
 {
   "ingredients": [
     {
-      "name": "ingredient name",
-      "classification": "very good" or "good" or "bad" or "very bad",
-      "impacts": [
-        {
-          "metric": "health metric name",
-          "effect": "description of specific effect",
-          "severity": "positive" or "negative" or "neutral"
-        }
-      ],
-      "warnings": ["list of specific warnings"] or [],
-      "recommendations": ["list of recommendations"] or []
+      "name": "ingredient",
+      "classification": "good" or "bad",
+      "impacts": [{"metric": "health metric", "effect": "brief effect", "severity": "positive/negative"}],
+      "warnings": ["key warnings"] or []
     }
   ]
 }
 
-IMPORTANT: Format the response as valid JSON without any markdown formatting or additional text."""
+IMPORTANT: Be concise. Format as valid JSON only."""
 
             # Create the analysis prompt for this chunk
             analysis_prompt = f"""Health Data:
@@ -343,8 +336,8 @@ Format the response as specified JSON without any markdown formatting or additio
             response = client.chat.completions.create(
                 messages=messages,
                 model="jamba-large",
-                temperature=0.1,  # Low temperature for more consistent responses
-                max_tokens=4000   # Increased max tokens to handle larger responses
+                temperature=0.1,
+                max_tokens=2000
             )
 
             # Get the response text
