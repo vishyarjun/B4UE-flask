@@ -296,25 +296,91 @@ def analyze_ingredients():
             logger.warning(f"Limiting analysis to first {max_ingredients} ingredients")
 
         # Create a simplified prompt for ingredient analysis
-        system_prompt = """You are a nutrition expert. Analyze ingredients for health impact.
-For each ingredient, determine if it's good or bad based on the health data.
+        system_prompt = """You are a nutrition expert. Analyze ingredients for health impact based on the provided health data.
+For each ingredient, determine if it's good or bad considering:
+- Dietary requirements (e.g., vegetarian, vegan)
+- Allergies
+- Health conditions (e.g., cholesterol, diabetes, fatty liver)
+- Lab test results (if provided)
 
 Return ONLY a JSON array with this format:
 [
   {
     "name": "ingredient name",
     "classification": "good" or "bad",
-    "key_impact": "brief description of main health impact"
+    "key_impact": "brief description of main health impact related to the user's specific health conditions"
   }
 ]
 
 Be extremely concise. No explanations outside the JSON."""
 
-        # Create a simplified analysis prompt
-        analysis_prompt = f"""Health profile: {json.dumps(health_data, indent=2)}
-Ingredients: {json.dumps(ingredients, indent=2)}
+        # Create a simplified analysis prompt that extracts key health information
+        health_summary = {}
+        
+        # Extract dietary requirements
+        if "dietaryRequirement" in health_data:
+            health_summary["diet"] = health_data["dietaryRequirement"]
+            
+        # Extract allergies
+        if "allergies" in health_data and health_data["allergies"]:
+            health_summary["allergies"] = health_data["allergies"]
+            
+        # Extract health conditions
+        if "healthConditions" in health_data and health_data["healthConditions"]:
+            health_summary["conditions"] = health_data["healthConditions"]
+            
+        # Extract key lab values that are outside reference range
+        if "additionalHealthData" in health_data and health_data["additionalHealthData"]:
+            abnormal_labs = {}
+            for test, data in health_data["additionalHealthData"].items():
+                if "result" in data and "referenceInterval" in data:
+                    # Try to determine if result is outside reference range
+                    try:
+                        result = float(data["result"])
+                        ref_interval = data["referenceInterval"]
+                        
+                        # Handle different reference interval formats
+                        if "-" in ref_interval:
+                            low, high = map(float, ref_interval.split("-"))
+                            if result < low or result > high:
+                                abnormal_labs[test] = {
+                                    "result": result,
+                                    "reference": ref_interval,
+                                    "units": data.get("units", "")
+                                }
+                        elif ">" in ref_interval:
+                            threshold = float(ref_interval.replace(">", "").strip())
+                            if result <= threshold:
+                                abnormal_labs[test] = {
+                                    "result": result,
+                                    "reference": ref_interval,
+                                    "units": data.get("units", "")
+                                }
+                        elif "<" in ref_interval:
+                            threshold = float(ref_interval.replace("<", "").strip())
+                            if result >= threshold:
+                                abnormal_labs[test] = {
+                                    "result": result,
+                                    "reference": ref_interval,
+                                    "units": data.get("units", "")
+                                }
+                    except (ValueError, TypeError):
+                        # If we can't parse the values, include the test anyway
+                        abnormal_labs[test] = {
+                            "result": data.get("result", ""),
+                            "reference": data.get("referenceInterval", ""),
+                            "units": data.get("units", "")
+                        }
+            
+            if abnormal_labs:
+                health_summary["abnormal_labs"] = abnormal_labs
+        
+        # Create the analysis prompt with the simplified health summary
+        analysis_prompt = f"""Health profile: {json.dumps(health_summary, indent=2)}
 
-Analyze each ingredient's impact on health. Return ONLY the JSON array."""
+Ingredients to analyze: {json.dumps([i.get("name") for i in ingredients], indent=2)}
+
+Analyze each ingredient's impact on this specific health profile. Return ONLY the JSON array."""
 
         # Call AI21 API with reduced tokens
         messages = [
