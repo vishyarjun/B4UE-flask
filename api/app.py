@@ -289,145 +289,123 @@ def analyze_ingredients():
         if not client:
             return jsonify({'error': 'AI21 client initialization failed'}), 500
 
-        # Split ingredients into smaller chunks if too many
-        chunk_size = 20
-        ingredient_chunks = [ingredients[i:i + chunk_size] for i in range(0, len(ingredients), chunk_size)]
+        # Limit the number of ingredients to analyze (to prevent timeouts)
+        max_ingredients = 30
+        if len(ingredients) > max_ingredients:
+            ingredients = ingredients[:max_ingredients]
+            logger.warning(f"Limiting analysis to first {max_ingredients} ingredients")
+
+        # Create a simplified prompt for ingredient analysis
+        system_prompt = """You are a nutrition expert. Analyze ingredients for health impact.
+For each ingredient, determine if it's good or bad based on the health data.
+
+Return ONLY a JSON array with this format:
+[
+  {
+    "name": "ingredient name",
+    "classification": "good" or "bad",
+    "key_impact": "brief description of main health impact"
+  }
+]
+
+Be extremely concise. No explanations outside the JSON."""
+
+        # Create a simplified analysis prompt
+        analysis_prompt = f"""Health profile: {json.dumps(health_data, indent=2)}
+Ingredients: {json.dumps(ingredients, indent=2)}
+
+Analyze each ingredient's impact on health. Return ONLY the JSON array."""
+
+        # Call AI21 API with reduced tokens
+        messages = [
+            SystemMessage(content=system_prompt, role="system"),
+            UserMessage(content=analysis_prompt, role="user")
+        ]
         
-        all_analyzed_ingredients = []
-        
-        for chunk in ingredient_chunks:
-            # Create a detailed prompt for ingredient analysis
-            system_prompt = """You are a health and nutrition expert. Analyze each ingredient's impact on health metrics.
-For each ingredient, determine:
-1. Overall classification (good/bad)
-2. Key impacts on health
-3. Any warnings
+        response = client.chat.completions.create(
+            messages=messages,
+            model="jamba-large",
+            temperature=0.1,
+            max_tokens=1500
+        )
 
-Provide analysis in this JSON format:
-{
-  "ingredients": [
-    {
-      "name": "ingredient",
-      "classification": "good" or "bad",
-      "impacts": [{"metric": "health metric", "effect": "brief effect", "severity": "positive/negative"}],
-      "warnings": ["key warnings"] or []
-    }
-  ]
-}
+        # Get the response text
+        analysis = response.choices[0].message.content
 
-IMPORTANT: Be concise. Format as valid JSON only."""
-
-            # Create the analysis prompt for this chunk
-            analysis_prompt = f"""Health Data:
-{json.dumps(health_data, indent=2)}
-
-Ingredients to analyze:
-{json.dumps(chunk, indent=2)}
-
-Analyze each ingredient's impact on these health metrics. Consider interactions and cumulative effects.
-Format the response as specified JSON without any markdown formatting or additional text."""
-
-            # Call AI21 API with increased max tokens
-            messages = [
-                SystemMessage(content=system_prompt, role="system"),
-                UserMessage(content=analysis_prompt, role="user")
-            ]
+        # Try to parse the response as JSON
+        try:
+            # Clean up the response to ensure it's valid JSON
+            cleaned_response = analysis.strip()
             
-            response = client.chat.completions.create(
-                messages=messages,
-                model="jamba-large",
-                temperature=0.1,
-                max_tokens=2000
-            )
-
-            # Get the response text
-            analysis = response.choices[0].message.content
-
-            # Try to parse the response as JSON
-            try:
-                # Clean up the response to ensure it's valid JSON
-                cleaned_response = analysis.strip()
+            # Remove any markdown formatting
+            if cleaned_response.startswith('```'):
+                cleaned_response = cleaned_response.split('\n', 1)[1]
+            if cleaned_response.endswith('```'):
+                cleaned_response = cleaned_response.rsplit('\n', 1)[0]
+            if cleaned_response.startswith('json'):
+                cleaned_response = cleaned_response.split('\n', 1)[1]
                 
-                # Remove any markdown formatting
-                if cleaned_response.startswith('```'):
-                    cleaned_response = cleaned_response.split('\n', 1)[1]  # Remove first line
-                if cleaned_response.endswith('```'):
-                    cleaned_response = cleaned_response.rsplit('\n', 1)[0]  # Remove last line
-                if cleaned_response.startswith('json'):
-                    cleaned_response = cleaned_response.split('\n', 1)[1]  # Remove json tag
-                    
-                cleaned_response = cleaned_response.strip()
+            cleaned_response = cleaned_response.strip()
+            
+            # Parse and validate the response
+            analyzed_ingredients = json.loads(cleaned_response)
+            
+            # Ensure we have a list
+            if not isinstance(analyzed_ingredients, list):
+                if "ingredients" in analyzed_ingredients:
+                    analyzed_ingredients = analyzed_ingredients.get("ingredients", [])
+                else:
+                    return jsonify({
+                        "error": "Invalid response format",
+                        "details": "Response is not a list or doesn't contain ingredients"
+                    }), 500
+            
+            # Format the response
+            formatted_response = {
+                "ingredients": [],
+                "summary": {
+                    "safe_to_consume": True,
+                    "overall_impact": "Analysis completed successfully"
+                }
+            }
+            
+            # Count bad ingredients
+            bad_count = 0
+            
+            # Process each ingredient
+            for item in analyzed_ingredients:
+                ingredient = {
+                    "name": item.get("name", "").strip(),
+                    "classification": item.get("classification", "unknown"),
+                    "impacts": [
+                        {
+                            "metric": "health",
+                            "effect": item.get("key_impact", ""),
+                            "severity": "negative" if item.get("classification") == "bad" else "positive"
+                        }
+                    ],
+                    "warnings": [] if item.get("classification") != "bad" else ["May have negative health effects"]
+                }
                 
-                # Parse and validate the response
-                parsed_response = json.loads(cleaned_response)
+                if ingredient["classification"] == "bad":
+                    bad_count += 1
                 
-                # Add ingredients from this chunk to the overall list
-                chunk_ingredients = parsed_response.get("ingredients", [])
-                all_analyzed_ingredients.extend(chunk_ingredients)
+                formatted_response["ingredients"].append(ingredient)
+            
+            # Update safety assessment
+            if bad_count > len(formatted_response["ingredients"]) / 2:
+                formatted_response["summary"]["safe_to_consume"] = False
+                formatted_response["summary"]["overall_impact"] = "High proportion of harmful ingredients"
+            
+            return jsonify(formatted_response)
                 
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON parsing error in chunk: {str(e)}")
-                logger.error(f"Raw chunk response: {analysis}")
-                continue  # Skip this chunk if parsing fails
-        
-        if not all_analyzed_ingredients:
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parsing error: {str(e)}")
+            logger.error(f"Raw response: {analysis}")
             return jsonify({
-                "error": "Failed to analyze any ingredients",
-                "details": "All chunks failed to parse"
+                "error": "Failed to parse analysis",
+                "details": str(e)
             }), 500
-            
-        # Create the final response with all analyzed ingredients
-        formatted_response = {
-            "ingredients": [],
-            "summary": {
-                "safe_to_consume": True,  # Will be updated based on analysis
-                "overall_impact": "Analysis completed successfully"
-            }
-        }
-        
-        # Format each ingredient analysis
-        bad_ingredient_count = 0
-        very_bad_ingredient_count = 0
-        
-        for ingredient in all_analyzed_ingredients:
-            formatted_ingredient = {
-                "name": ingredient.get("name", "").strip(),
-                "classification": ingredient.get("classification", "unknown"),
-                "impacts": [],
-                "warnings": ingredient.get("warnings", []),
-                "recommendations": ingredient.get("recommendations", [])
-            }
-            
-            # Count bad and very bad ingredients
-            if formatted_ingredient["classification"] == "bad":
-                bad_ingredient_count += 1
-            elif formatted_ingredient["classification"] == "very bad":
-                very_bad_ingredient_count += 1
-            
-            # Format impacts
-            for impact in ingredient.get("impacts", []):
-                if isinstance(impact, dict):
-                    formatted_impact = {
-                        "metric": impact.get("metric", "").strip(),
-                        "effect": impact.get("effect", "").strip(),
-                        "severity": impact.get("severity", "neutral")
-                    }
-                    if formatted_impact["metric"] and formatted_impact["effect"]:
-                        formatted_ingredient["impacts"].append(formatted_impact)
-            
-            formatted_response["ingredients"].append(formatted_ingredient)
-        
-        # Update safety assessment based on bad ingredient counts
-        if very_bad_ingredient_count > 0:
-            formatted_response["summary"]["safe_to_consume"] = False
-            formatted_response["summary"]["overall_impact"] = "Contains very harmful ingredients, consumption not recommended"
-        elif bad_ingredient_count > len(formatted_response["ingredients"]) / 3:  # If more than 1/3 are bad
-            formatted_response["summary"]["safe_to_consume"] = False
-            formatted_response["summary"]["overall_impact"] = "High proportion of harmful ingredients, limited consumption recommended"
-        else:
-            formatted_response["summary"]["overall_impact"] = "Moderate to low health impact, consume in moderation"
-        
-        return jsonify(formatted_response)
             
     except Exception as e:
         logger.error(f"Error in ingredient analysis endpoint: {str(e)}")
