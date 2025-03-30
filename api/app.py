@@ -290,7 +290,7 @@ def analyze_ingredients():
             return jsonify({'error': 'AI21 client initialization failed'}), 500
 
         # Limit the number of ingredients to analyze (to prevent timeouts)
-        max_ingredients = 30
+        max_ingredients = 15  
         if len(ingredients) > max_ingredients:
             ingredients = ingredients[:max_ingredients]
             logger.warning(f"Limiting analysis to first {max_ingredients} ingredients")
@@ -317,7 +317,7 @@ Be extremely concise. No explanations outside the JSON."""
         # Create a simplified analysis prompt that extracts key health information
         health_summary = {}
         
-        # Extract dietary requirements
+        # Extract only essential health data to reduce payload size
         if "dietaryRequirement" in health_data:
             health_summary["diet"] = health_data["dietaryRequirement"]
             
@@ -329,48 +329,45 @@ Be extremely concise. No explanations outside the JSON."""
         if "healthConditions" in health_data and health_data["healthConditions"]:
             health_summary["conditions"] = health_data["healthConditions"]
             
-        # Extract key lab values that are outside reference range
+        # Extract only critical lab values that are outside reference range
         if "additionalHealthData" in health_data and health_data["additionalHealthData"]:
             abnormal_labs = {}
             for test, data in health_data["additionalHealthData"].items():
-                if "result" in data and "referenceInterval" in data:
-                    # Try to determine if result is outside reference range
-                    try:
-                        result = float(data["result"])
-                        ref_interval = data["referenceInterval"]
-                        
-                        # Handle different reference interval formats
-                        if "-" in ref_interval:
-                            low, high = map(float, ref_interval.split("-"))
-                            if result < low or result > high:
-                                abnormal_labs[test] = {
-                                    "result": result,
-                                    "reference": ref_interval,
-                                    "units": data.get("units", "")
-                                }
-                        elif ">" in ref_interval:
-                            threshold = float(ref_interval.replace(">", "").strip())
-                            if result <= threshold:
-                                abnormal_labs[test] = {
-                                    "result": result,
-                                    "reference": ref_interval,
-                                    "units": data.get("units", "")
-                                }
-                        elif "<" in ref_interval:
-                            threshold = float(ref_interval.replace("<", "").strip())
-                            if result >= threshold:
-                                abnormal_labs[test] = {
-                                    "result": result,
-                                    "reference": ref_interval,
-                                    "units": data.get("units", "")
-                                }
-                    except (ValueError, TypeError):
-                        # If we can't parse the values, include the test anyway
-                        abnormal_labs[test] = {
-                            "result": data.get("result", ""),
-                            "reference": data.get("referenceInterval", ""),
-                            "units": data.get("units", "")
-                        }
+                # Only include tests that are likely to affect nutrition
+                if test.lower() in ["glucose", "cholesterol", "triglycerides", "hdl", "ldl", "a1c", "sodium", "potassium"]:
+                    if "result" in data and "referenceInterval" in data:
+                        try:
+                            result = float(data["result"])
+                            ref_interval = data["referenceInterval"]
+                            
+                            # Handle different reference interval formats
+                            if "-" in ref_interval:
+                                low, high = map(float, ref_interval.split("-"))
+                                if result < low or result > high:
+                                    abnormal_labs[test] = {
+                                        "result": result,
+                                        "reference": ref_interval,
+                                        "units": data.get("units", "")
+                                    }
+                            elif ">" in ref_interval:
+                                threshold = float(ref_interval.replace(">", "").strip())
+                                if result <= threshold:
+                                    abnormal_labs[test] = {
+                                        "result": result,
+                                        "reference": ref_interval,
+                                        "units": data.get("units", "")
+                                    }
+                            elif "<" in ref_interval:
+                                threshold = float(ref_interval.replace("<", "").strip())
+                                if result >= threshold:
+                                    abnormal_labs[test] = {
+                                        "result": result,
+                                        "reference": ref_interval,
+                                        "units": data.get("units", "")
+                                    }
+                        except (ValueError, TypeError):
+                            # Skip tests with parsing issues
+                            pass
             
             if abnormal_labs:
                 health_summary["abnormal_labs"] = abnormal_labs
@@ -382,21 +379,83 @@ Ingredients to analyze: {json.dumps([i.get("name") for i in ingredients], indent
 
 Analyze each ingredient's impact on this specific health profile. Return ONLY the JSON array."""
 
-        # Call AI21 API with reduced tokens
+        # Call AI21 API with reduced tokens and explicit timeout
         messages = [
             SystemMessage(content=system_prompt, role="system"),
             UserMessage(content=analysis_prompt, role="user")
         ]
         
-        response = client.chat.completions.create(
-            messages=messages,
-            model="jamba-large",
-            temperature=0.1,
-            max_tokens=1500
-        )
-
-        # Get the response text
-        analysis = response.choices[0].message.content
+        try:
+            # Set a timeout for the API call
+            import threading
+            import time
+            
+            response_container = {"response": None, "error": None}
+            
+            def api_call():
+                try:
+                    response = client.chat.completions.create(
+                        messages=messages,
+                        model="jamba-large",
+                        temperature=0.1,
+                        max_tokens=1000  
+                    )
+                    response_container["response"] = response
+                except Exception as e:
+                    response_container["error"] = str(e)
+            
+            # Start API call in a thread
+            thread = threading.Thread(target=api_call)
+            thread.start()
+            
+            # Wait for a maximum of 25 seconds
+            thread.join(timeout=25)
+            
+            if thread.is_alive():
+                # API call is still running after timeout
+                logger.warning("AI21 API call timed out after 25 seconds")
+                
+                # Return a fallback response
+                fallback_response = {
+                    "ingredients": [],
+                    "summary": {
+                        "safe_to_consume": True,
+                        "overall_impact": "Analysis timed out. Please try again with fewer ingredients."
+                    }
+                }
+                
+                # Add basic analysis for each ingredient
+                for item in ingredients:
+                    ingredient_name = item.get("name", "").strip()
+                    fallback_response["ingredients"].append({
+                        "name": ingredient_name,
+                        "classification": "unknown",
+                        "impacts": [
+                            {
+                                "metric": "health",
+                                "effect": "Analysis timed out",
+                                "severity": "neutral"
+                            }
+                        ],
+                        "warnings": []
+                    })
+                
+                return jsonify(fallback_response)
+            
+            if response_container["error"]:
+                raise Exception(response_container["error"])
+            
+            response = response_container["response"]
+            
+            # Get the response text
+            analysis = response.choices[0].message.content
+            
+        except Exception as e:
+            logger.error(f"AI21 API error: {str(e)}")
+            return jsonify({
+                "error": "AI service unavailable",
+                "details": str(e)
+            }), 503
 
         # Try to parse the response as JSON
         try:
