@@ -274,6 +274,9 @@ def analyze_ingredients():
     Returns impact analysis and classification for each ingredient
     """
     try:
+        # Start timing the request
+        start_time = time.time()
+        
         data = request.get_json()
         if not data:
             return jsonify({'error': 'No data provided'}), 400
@@ -290,7 +293,7 @@ def analyze_ingredients():
             return jsonify({'error': 'AI21 client initialization failed'}), 500
 
         # Limit the number of ingredients to analyze (to prevent timeouts)
-        max_ingredients = 15  
+        max_ingredients = 10  
         if len(ingredients) > max_ingredients:
             ingredients = ingredients[:max_ingredients]
             logger.warning(f"Limiting analysis to first {max_ingredients} ingredients")
@@ -301,14 +304,13 @@ For each ingredient, determine if it's good or bad considering:
 - Dietary requirements (e.g., vegetarian, vegan)
 - Allergies
 - Health conditions (e.g., cholesterol, diabetes, fatty liver)
-- Lab test results (if provided)
 
 Return ONLY a JSON array with this format:
 [
   {
     "name": "ingredient name",
     "classification": "good" or "bad",
-    "key_impact": "brief description of main health impact related to the user's specific health conditions"
+    "key_impact": "brief one-sentence impact"
   }
 ]
 
@@ -325,59 +327,54 @@ Be extremely concise. No explanations outside the JSON."""
         if "allergies" in health_data and health_data["allergies"]:
             health_summary["allergies"] = health_data["allergies"]
             
-        # Extract health conditions
+        # Extract health conditions - limit to most critical ones
         if "healthConditions" in health_data and health_data["healthConditions"]:
-            health_summary["conditions"] = health_data["healthConditions"]
+            # Only include the most nutrition-relevant conditions
+            relevant_conditions = []
+            for condition in health_data["healthConditions"]:
+                condition_lower = condition.lower()
+                if any(keyword in condition_lower for keyword in ["diabetes", "cholesterol", "heart", "liver", "kidney", "pressure", "celiac"]):
+                    relevant_conditions.append(condition)
             
-        # Extract only critical lab values that are outside reference range
+            if relevant_conditions:
+                health_summary["conditions"] = relevant_conditions
+            
+        # Extract only critical lab values - limit to just a few key ones
         if "additionalHealthData" in health_data and health_data["additionalHealthData"]:
             abnormal_labs = {}
+            critical_tests = ["glucose", "cholesterol", "triglycerides", "a1c"]
+            
             for test, data in health_data["additionalHealthData"].items():
-                # Only include tests that are likely to affect nutrition
-                if test.lower() in ["glucose", "cholesterol", "triglycerides", "hdl", "ldl", "a1c", "sodium", "potassium"]:
+                if any(critical in test.lower() for critical in critical_tests):
                     if "result" in data and "referenceInterval" in data:
                         try:
                             result = float(data["result"])
                             ref_interval = data["referenceInterval"]
                             
-                            # Handle different reference interval formats
+                            # Simplified reference interval check
                             if "-" in ref_interval:
                                 low, high = map(float, ref_interval.split("-"))
                                 if result < low or result > high:
                                     abnormal_labs[test] = {
                                         "result": result,
-                                        "reference": ref_interval,
-                                        "units": data.get("units", "")
-                                    }
-                            elif ">" in ref_interval:
-                                threshold = float(ref_interval.replace(">", "").strip())
-                                if result <= threshold:
-                                    abnormal_labs[test] = {
-                                        "result": result,
-                                        "reference": ref_interval,
-                                        "units": data.get("units", "")
-                                    }
-                            elif "<" in ref_interval:
-                                threshold = float(ref_interval.replace("<", "").strip())
-                                if result >= threshold:
-                                    abnormal_labs[test] = {
-                                        "result": result,
-                                        "reference": ref_interval,
                                         "units": data.get("units", "")
                                     }
                         except (ValueError, TypeError):
-                            # Skip tests with parsing issues
                             pass
             
             if abnormal_labs:
                 health_summary["abnormal_labs"] = abnormal_labs
         
         # Create the analysis prompt with the simplified health summary
-        analysis_prompt = f"""Health profile: {json.dumps(health_summary, indent=2)}
-
-Ingredients to analyze: {json.dumps([i.get("name") for i in ingredients], indent=2)}
-
+        analysis_prompt = f"""Health profile: {json.dumps(health_summary)}
+Ingredients to analyze: {json.dumps([i.get("name", "") for i in ingredients])}
 Analyze each ingredient's impact on this specific health profile. Return ONLY the JSON array."""
+
+        # Check if we've already spent too much time preparing the request
+        elapsed_time = time.time() - start_time
+        if elapsed_time > 10:  # If preparation took more than 10 seconds, use fallback
+            logger.warning(f"Request preparation took {elapsed_time} seconds, using fallback response")
+            return generate_fallback_response(ingredients)
 
         # Call AI21 API with reduced tokens and explicit timeout
         messages = [
@@ -388,9 +385,8 @@ Analyze each ingredient's impact on this specific health profile. Return ONLY th
         try:
             # Set a timeout for the API call
             import threading
-            import time
             
-            response_container = {"response": None, "error": None}
+            response_container = {"response": None, "error": None, "completed": False}
             
             def api_call():
                 try:
@@ -398,92 +394,83 @@ Analyze each ingredient's impact on this specific health profile. Return ONLY th
                         messages=messages,
                         model="jamba-large",
                         temperature=0.1,
-                        max_tokens=1000  
+                        max_tokens=800  
                     )
                     response_container["response"] = response
+                    response_container["completed"] = True
                 except Exception as e:
                     response_container["error"] = str(e)
+                    response_container["completed"] = True
             
             # Start API call in a thread
             thread = threading.Thread(target=api_call)
+            thread.daemon = True  # Make thread a daemon so it doesn't block process exit
             thread.start()
             
-            # Wait for a maximum of 25 seconds
-            thread.join(timeout=25)
+            # Wait for a maximum of 20 seconds (reduced from 25)
+            max_wait_time = 20
+            wait_interval = 0.5
+            total_waited = 0
             
-            if thread.is_alive():
+            while not response_container["completed"] and total_waited < max_wait_time:
+                time.sleep(wait_interval)
+                total_waited += wait_interval
+                
+                # Check if we're getting close to the timeout
+                if total_waited >= max_wait_time * 0.8:
+                    logger.warning(f"API call taking too long ({total_waited} seconds), preparing fallback")
+            
+            if not response_container["completed"]:
                 # API call is still running after timeout
-                logger.warning("AI21 API call timed out after 25 seconds")
-                
-                # Return a fallback response
-                fallback_response = {
-                    "ingredients": [],
-                    "summary": {
-                        "safe_to_consume": True,
-                        "overall_impact": "Analysis timed out. Please try again with fewer ingredients."
-                    }
-                }
-                
-                # Add basic analysis for each ingredient
-                for item in ingredients:
-                    ingredient_name = item.get("name", "").strip()
-                    fallback_response["ingredients"].append({
-                        "name": ingredient_name,
-                        "classification": "unknown",
-                        "impacts": [
-                            {
-                                "metric": "health",
-                                "effect": "Analysis timed out",
-                                "severity": "neutral"
-                            }
-                        ],
-                        "warnings": []
-                    })
-                
-                return jsonify(fallback_response)
+                logger.warning(f"AI21 API call timed out after {total_waited} seconds")
+                return generate_fallback_response(ingredients)
             
             if response_container["error"]:
-                raise Exception(response_container["error"])
+                logger.error(f"AI21 API error: {response_container['error']}")
+                return generate_fallback_response(ingredients)
             
             response = response_container["response"]
             
             # Get the response text
             analysis = response.choices[0].message.content
             
+            # Check if we're approaching the function timeout
+            elapsed_time = time.time() - start_time
+            if elapsed_time > 25:  # If we've already spent 25+ seconds, use fallback
+                logger.warning(f"Processing taking too long ({elapsed_time} seconds), using fallback")
+                return generate_fallback_response(ingredients)
+            
         except Exception as e:
             logger.error(f"AI21 API error: {str(e)}")
-            return jsonify({
-                "error": "AI service unavailable",
-                "details": str(e)
-            }), 503
+            return generate_fallback_response(ingredients)
 
         # Try to parse the response as JSON
         try:
             # Clean up the response to ensure it's valid JSON
             cleaned_response = analysis.strip()
             
-            # Remove any markdown formatting
-            if cleaned_response.startswith('```'):
-                cleaned_response = cleaned_response.split('\n', 1)[1]
-            if cleaned_response.endswith('```'):
-                cleaned_response = cleaned_response.rsplit('\n', 1)[0]
-            if cleaned_response.startswith('json'):
-                cleaned_response = cleaned_response.split('\n', 1)[1]
+            # Remove any markdown formatting - simplified cleanup
+            if "```" in cleaned_response:
+                cleaned_response = cleaned_response.replace("```json", "").replace("```", "")
                 
             cleaned_response = cleaned_response.strip()
+            
+            # Check if we're approaching the function timeout
+            elapsed_time = time.time() - start_time
+            if elapsed_time > 27:  # If we've already spent 27+ seconds, use fallback
+                logger.warning(f"JSON parsing taking too long ({elapsed_time} seconds), using fallback")
+                return generate_fallback_response(ingredients)
             
             # Parse and validate the response
             analyzed_ingredients = json.loads(cleaned_response)
             
             # Ensure we have a list
             if not isinstance(analyzed_ingredients, list):
-                if "ingredients" in analyzed_ingredients:
+                if isinstance(analyzed_ingredients, dict) and "ingredients" in analyzed_ingredients:
                     analyzed_ingredients = analyzed_ingredients.get("ingredients", [])
                 else:
-                    return jsonify({
-                        "error": "Invalid response format",
-                        "details": "Response is not a list or doesn't contain ingredients"
-                    }), 500
+                    logger.warning("Invalid response format, using fallback")
+                    return generate_fallback_response(ingredients)
             
             # Format the response
             formatted_response = {
@@ -527,10 +514,7 @@ Analyze each ingredient's impact on this specific health profile. Return ONLY th
         except json.JSONDecodeError as e:
             logger.error(f"JSON parsing error: {str(e)}")
             logger.error(f"Raw response: {analysis}")
-            return jsonify({
-                "error": "Failed to parse analysis",
-                "details": str(e)
-            }), 500
+            return generate_fallback_response(ingredients)
             
     except Exception as e:
         logger.error(f"Error in ingredient analysis endpoint: {str(e)}")
@@ -538,6 +522,36 @@ Analyze each ingredient's impact on this specific health profile. Return ONLY th
             'error': 'Internal server error',
             'details': str(e)
         }), 500
+
+def generate_fallback_response(ingredients):
+    """
+    Generate a fallback response when AI analysis fails or times out
+    """
+    fallback_response = {
+        "ingredients": [],
+        "summary": {
+            "safe_to_consume": True,
+            "overall_impact": "Analysis could not be completed. Please try again with fewer ingredients."
+        }
+    }
+    
+    # Add basic analysis for each ingredient
+    for item in ingredients:
+        ingredient_name = item.get("name", "").strip()
+        fallback_response["ingredients"].append({
+            "name": ingredient_name,
+            "classification": "unknown",
+            "impacts": [
+                {
+                    "metric": "health",
+                    "effect": "Could not analyze this ingredient",
+                    "severity": "neutral"
+                }
+            ],
+            "warnings": []
+        })
+    
+    return jsonify(fallback_response)
 
 @app.route('/health', methods=['GET'])
 def health_check():
